@@ -45,7 +45,7 @@
     }
     textarea {
       width: 100%;
-      height: 180px;
+      height: 220px;
       background: #0f141d;
       border: 1px solid var(--border);
       color: #fff;
@@ -105,6 +105,8 @@
       color: var(--text-muted);
       white-space: pre-wrap;
       font-family: monospace;
+      max-height: 120px;
+      overflow-y: auto;
     }
   </style>
 </head>
@@ -112,9 +114,9 @@
 
 <div class="container">
   <h1>Lorcana Proxy Sheet Generator</h1>
-  <p>Paste your decklist or card names below (e.g. <code>4 Elsa - Spirit of Winter</code> or <code>1 Stitch - Rock Star</code>).</p>
+  <p>Paste your decklist or card names below (e.g. <code>4 Strength of a Raging Fire</code> or <code>1 Max Goof - Rebellious Teen</code>).</p>
 
-  <textarea id="decklist" placeholder="4 Elsa - Spirit of Winter&#10;2 Tinker Bell - Giant Fairy&#10;Maleficent - Monstrous Dragon"></textarea>
+  <textarea id="decklist" placeholder="4 Strength of a Raging Fire&#10;1 Max Goof - Rebellious Teen&#10;3 Angela - Night Warrior&#10;You Broke My Smolder"></textarea>
 
   <div class="options">
     <label>
@@ -135,18 +137,71 @@
   const MM_TO_PT = 2.83465;
   const CARD_WIDTH_MM = 63;
   const CARD_HEIGHT_MM = 88;
-  const CARD_W = CARD_WIDTH_MM * MM_TO_PT; // ~178.58 pt
-  const CARD_H = CARD_HEIGHT_MM * MM_TO_PT; // ~249.45 pt
+  const CARD_W = CARD_WIDTH_MM * MM_TO_PT;
+  const CARD_H = CARD_HEIGHT_MM * MM_TO_PT;
 
   function log(msg) {
-    document.getElementById("status").textContent = msg;
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // --- IndexedDB Local Persistent Cache ---
+  function openCacheDB() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open("LorcanaProxyCache", 1);
+      request.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains("card_images")) {
+          db.createObjectStore("card_images");
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function getCachedImage(key) {
+    try {
+      const db = await openCacheDB();
+      return new Promise((resolve) => {
+        const tx = db.transaction("card_images", "readonly");
+        const store = tx.objectStore("card_images");
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  async function setCachedImage(key, buffer) {
+    try {
+      const db = await openCacheDB();
+      const tx = db.transaction("card_images", "readwrite");
+      const store = tx.objectStore("card_images");
+      store.put(buffer, key);
+    } catch (err) {
+      console.warn("Failed saving image to IndexedDB", err);
+    }
+  }
+
+  // Helper to normalize card names into repo image paths
+  function slugify(text) {
+    return text
+      .toLowerCase()
+      .trim()
+      .replace(/\s*-\s*/g, "-")
+      .replace(/[^a-z0-9\-]/g, "")
+      .replace(/\-+/g, "-");
   }
 
   function parseLine(line) {
     line = line.trim();
     if (!line) return null;
-    
-    // Matches: "4x Card Name", "4 Card Name", or just "Card Name"
     const match = line.match(/^(\d+)x?\s+(.*)$/i);
     if (match) {
       return { count: parseInt(match[1], 10), name: match[2].trim() };
@@ -154,26 +209,86 @@
     return { count: 1, name: line };
   }
 
-  async function fetchCardImage(name) {
+  async function fetchWithTimeout(url, options = {}, timeoutMs = 7000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      // Query the Lorcast search endpoint for fuzzy matching
-      const url = `https://api.lorcast.com/v0/cards/search?q=${encodeURIComponent(name)}`;
-      const res = await fetch(url);
-      if (!res.ok) return null;
-      const data = await res.json();
-      
-      if (data && data.results && data.results.length > 0) {
-        const card = data.results[0];
-        // Prefer large/standard image URIs
-        return card.image_uris?.digital?.large || card.image_uris?.digital?.normal || null;
-      }
-      return null;
-    } catch (e) {
-      console.error(e);
-      return null;
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(id);
+      return response;
+    } catch (err) {
+      clearTimeout(id);
+      throw err;
     }
   }
 
+  // --- Step 1: Check Repo Cache, IndexedDB, or Lorcast API ---
+  async function resolveCardImage(name) {
+    const slug = slugify(name);
+
+    // 1. Check browser's persistent IndexedDB
+    const idbCached = await getCachedImage(slug);
+    if (idbCached) {
+      return { buffer: idbCached, source: "browser cache" };
+    }
+
+    // 2. Check if image is hosted in your GitHub repo (/images folder)
+    const localExtensions = ["webp", "jpg", "jpeg", "png"];
+    for (const ext of localExtensions) {
+      const localUrl = `images/${slug}.${ext}`;
+      try {
+        const head = await fetch(localUrl, { method: "HEAD" });
+        if (head.ok) {
+          const res = await fetch(localUrl);
+          const buf = await res.arrayBuffer();
+          await setCachedImage(slug, buf);
+          return { buffer: buf, source: "github repo" };
+        }
+      } catch {}
+    }
+
+    // 3. Fallback: Search the public Lorcast API
+    try {
+      const url = `https://api.lorcast.com/v0/cards/search?q=${encodeURIComponent(name)}`;
+      const res = await fetchWithTimeout(url, {}, 6000);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.results && data.results.length > 0) {
+          const card = data.results[0];
+          const imgUrl = card.image_uris?.digital?.large || card.image_uris?.digital?.normal || null;
+          if (imgUrl) {
+            const buf = await downloadBufferWithFallback(imgUrl);
+            if (buf) {
+              await setCachedImage(slug, buf);
+              return { buffer: buf, source: "api download" };
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`API lookup failed for ${name}:`, e);
+    }
+
+    return null;
+  }
+
+  // Fetch image bytes with immediate CORS proxy fallback
+  async function downloadBufferWithFallback(url) {
+    try {
+      const res = await fetchWithTimeout(url, {}, 6000);
+      if (res.ok) return await res.arrayBuffer();
+    } catch {}
+
+    try {
+      const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+      const res = await fetchWithTimeout(proxyUrl, {}, 8000);
+      if (res.ok) return await res.arrayBuffer();
+    } catch {}
+
+    return null;
+  }
+
+  // --- Main PDF Generation Pipeline ---
   async function processList() {
     const btn = document.getElementById("generateBtn");
     const text = document.getElementById("decklist").value;
@@ -192,38 +307,45 @@
     }
 
     btn.disabled = true;
-    log("Resolving card images...");
+    log("Resolving card artwork...");
 
-    // Flatten count into individual card instances
+    const resolvedBuffers = {};
     const cardQueue = [];
+
     for (const entry of parsedCards) {
-      log(`Finding artwork: ${entry.name}...`);
-      const imgUrl = await fetchCardImage(entry.name);
-      if (!imgUrl) {
-        log(`Warning: Could not find image for "${entry.name}". Skipping.`);
-        continue;
+      const slug = slugify(entry.name);
+      
+      if (!resolvedBuffers[slug]) {
+        log(`Locating: ${entry.name}...`);
+        const result = await resolveCardImage(entry.name);
+        if (!result) {
+          log(`Skipping "${entry.name}" (not found in repo, cache, or API)`);
+          continue;
+        }
+        resolvedBuffers[slug] = result.buffer;
+        log(`✓ Loaded ${entry.name} (${result.source})`);
+        await delay(80); // gentle pacing
       }
+
       for (let i = 0; i < entry.count; i++) {
-        cardQueue.push({ name: entry.name, url: imgUrl });
+        cardQueue.push({ name: entry.name, buffer: resolvedBuffers[slug] });
       }
     }
 
     if (cardQueue.length === 0) {
-      log("No valid cards could be retrieved.");
+      log("No valid card images could be loaded.");
       btn.disabled = false;
       return;
     }
 
-    log(`Assembling PDF with ${cardQueue.length} cards...`);
+    log(`Assembling PDF with ${cardQueue.length} card(s)...`);
 
-    // Dimensions in points
     const pageWidth = paperType === "a4" ? 210 * MM_TO_PT : 8.5 * 72;
     const pageHeight = paperType === "a4" ? 297 * MM_TO_PT : 11 * 72;
 
     const { PDFDocument } = PDFLib;
     const pdfDoc = await PDFDocument.create();
 
-    // 3 columns x 3 rows grid
     const cols = 3;
     const rows = 3;
     const gridWidth = cols * CARD_W;
@@ -231,37 +353,36 @@
     const marginX = (pageWidth - gridWidth) / 2;
     const marginY = (pageHeight - gridHeight) / 2;
 
-    // Cache image bytes to avoid re-fetching duplicate cards
-    const imageCache = {};
-
+    const embeddedCache = new Map();
     let page = null;
+    let placedCards = 0;
+
     for (let i = 0; i < cardQueue.length; i++) {
-      const itemIndexOnPage = i % 9;
+      const item = cardQueue[i];
+
+      const itemIndexOnPage = placedCards % 9;
       if (itemIndexOnPage === 0) {
         page = pdfDoc.addPage([pageWidth, pageHeight]);
       }
 
       const col = itemIndexOnPage % 3;
       const row = Math.floor(itemIndexOnPage / 3);
-
       const x = marginX + col * CARD_W;
-      // PDF coordinates originate at the bottom-left
       const y = pageHeight - marginY - (row + 1) * CARD_H;
 
-      const item = cardQueue[i];
-      let imgBytes = imageCache[item.url];
-      if (!imgBytes) {
-        log(`Downloading image for ${item.name}...`);
-        const res = await fetch(item.url);
-        imgBytes = await res.arrayBuffer();
-        imageCache[item.url] = imgBytes;
-      }
-
-      let embeddedImg;
-      try {
-        embeddedImg = await pdfDoc.embedJpg(imgBytes);
-      } catch {
-        embeddedImg = await pdfDoc.embedPng(imgBytes);
+      let embeddedImg = embeddedCache.get(item.buffer);
+      if (!embeddedImg) {
+        try {
+          embeddedImg = await pdfDoc.embedJpg(item.buffer);
+        } catch {
+          try {
+            embeddedImg = await pdfDoc.embedPng(item.buffer);
+          } catch (err) {
+            console.error(`Embed error on ${item.name}`, err);
+            continue;
+          }
+        }
+        embeddedCache.set(item.buffer, embeddedImg);
       }
 
       page.drawImage(embeddedImg, {
@@ -270,9 +391,11 @@
         width: CARD_W,
         height: CARD_H,
       });
+
+      placedCards++;
     }
 
-    log("Finalizing PDF...");
+    log("Finalizing PDF download...");
     const pdfBytes = await pdfDoc.save();
     const blob = new Blob([pdfBytes], { type: "application/pdf" });
     const blobUrl = URL.createObjectURL(blob);
@@ -282,7 +405,7 @@
     a.download = "lorcana-proxies.pdf";
     a.click();
 
-    log(`Success! Generated PDF with ${cardQueue.length} card(s).`);
+    log(`Success! Generated PDF with ${placedCards} cards.`);
     btn.disabled = false;
   }
 </script>
