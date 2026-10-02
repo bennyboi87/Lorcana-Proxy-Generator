@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lorcana Proxy Sheet Generator</title>
+  <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <style>
+    :root {
+      --bg: #121824;
+      --card-bg: #1c2436;
+      --accent: #dca842;
+      --text: #f0f4f8;
+      --text-muted: #94a3b8;
+      --border: #2e3a52;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      padding: 40px 16px;
+      margin: 0;
+    }
+    .container {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 680px;
+      padding: 24px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+    }
+    h1 {
+      margin-top: 0;
+      color: var(--accent);
+      font-size: 1.5rem;
+      letter-spacing: 0.5px;
+    }
+    p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-bottom: 16px;
+    }
+    textarea {
+      width: 100%;
+      height: 180px;
+      background: #0f141d;
+      border: 1px solid var(--border);
+      color: #fff;
+      padding: 12px;
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 0.95rem;
+      box-sizing: border-box;
+      resize: vertical;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .options {
+      display: flex;
+      gap: 16px;
+      margin: 16px 0;
+    }
+    .options label {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    select {
+      background: #0f141d;
+      border: 1px solid var(--border);
+      color: #fff;
+      padding: 8px 12px;
+      border-radius: 6px;
+    }
+    button {
+      background: var(--accent);
+      color: #121824;
+      font-weight: 700;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 6px;
+      cursor: pointer;
+      width: 100%;
+      font-size: 1rem;
+      transition: opacity 0.2s;
+    }
+    button:hover:not(:disabled) {
+      opacity: 0.9;
+    }
+    button:disabled {
+      background: #475569;
+      cursor: not-allowed;
+      color: #94a3b8;
+    }
+    #status {
+      margin-top: 16px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      white-space: pre-wrap;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h1>Lorcana Proxy Sheet Generator</h1>
+  <p>Paste your decklist or card names below (e.g. <code>4 Elsa - Spirit of Winter</code> or <code>1 Stitch - Rock Star</code>).</p>
+
+  <textarea id="decklist" placeholder="4 Elsa - Spirit of Winter&#10;2 Tinker Bell - Giant Fairy&#10;Maleficent - Monstrous Dragon"></textarea>
+
+  <div class="options">
+    <label>
+      Paper Format
+      <select id="paperSize">
+        <option value="a4" selected>A4 (210 × 297 mm)</option>
+        <option value="letter">US Letter (8.5 × 11 in)</option>
+      </select>
+    </label>
+  </div>
+
+  <button id="generateBtn" onclick="processList()">Generate Proxy PDF</button>
+
+  <div id="status"></div>
+</div>
+
+<script>
+  const MM_TO_PT = 2.83465;
+  const CARD_WIDTH_MM = 63;
+  const CARD_HEIGHT_MM = 88;
+  const CARD_W = CARD_WIDTH_MM * MM_TO_PT; // ~178.58 pt
+  const CARD_H = CARD_HEIGHT_MM * MM_TO_PT; // ~249.45 pt
+
+  function log(msg) {
+    document.getElementById("status").textContent = msg;
+  }
+
+  function parseLine(line) {
+    line = line.trim();
+    if (!line) return null;
+    
+    // Matches: "4x Card Name", "4 Card Name", or just "Card Name"
+    const match = line.match(/^(\d+)x?\s+(.*)$/i);
+    if (match) {
+      return { count: parseInt(match[1], 10), name: match[2].trim() };
+    }
+    return { count: 1, name: line };
+  }
+
+  async function fetchCardImage(name) {
+    try {
+      // Query the Lorcast search endpoint for fuzzy matching
+      const url = `https://api.lorcast.com/v0/cards/search?q=${encodeURIComponent(name)}`;
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const data = await res.json();
+      
+      if (data && data.results && data.results.length > 0) {
+        const card = data.results[0];
+        // Prefer large/standard image URIs
+        return card.image_uris?.digital?.large || card.image_uris?.digital?.normal || null;
+      }
+      return null;
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  }
+
+  async function processList() {
+    const btn = document.getElementById("generateBtn");
+    const text = document.getElementById("decklist").value;
+    const paperType = document.getElementById("paperSize").value;
+    const lines = text.split("\n");
+
+    const parsedCards = [];
+    for (const l of lines) {
+      const item = parseLine(l);
+      if (item) parsedCards.push(item);
+    }
+
+    if (parsedCards.length === 0) {
+      log("Please enter at least one card name.");
+      return;
+    }
+
+    btn.disabled = true;
+    log("Resolving card images...");
+
+    // Flatten count into individual card instances
+    const cardQueue = [];
+    for (const entry of parsedCards) {
+      log(`Finding artwork: ${entry.name}...`);
+      const imgUrl = await fetchCardImage(entry.name);
+      if (!imgUrl) {
+        log(`Warning: Could not find image for "${entry.name}". Skipping.`);
+        continue;
+      }
+      for (let i = 0; i < entry.count; i++) {
+        cardQueue.push({ name: entry.name, url: imgUrl });
+      }
+    }
+
+    if (cardQueue.length === 0) {
+      log("No valid cards could be retrieved.");
+      btn.disabled = false;
+      return;
+    }
+
+    log(`Assembling PDF with ${cardQueue.length} cards...`);
+
+    // Dimensions in points
+    const pageWidth = paperType === "a4" ? 210 * MM_TO_PT : 8.5 * 72;
+    const pageHeight = paperType === "a4" ? 297 * MM_TO_PT : 11 * 72;
+
+    const { PDFDocument } = PDFLib;
+    const pdfDoc = await PDFDocument.create();
+
+    // 3 columns x 3 rows grid
+    const cols = 3;
+    const rows = 3;
+    const gridWidth = cols * CARD_W;
+    const gridHeight = rows * CARD_H;
+    const marginX = (pageWidth - gridWidth) / 2;
+    const marginY = (pageHeight - gridHeight) / 2;
+
+    // Cache image bytes to avoid re-fetching duplicate cards
+    const imageCache = {};
+
+    let page = null;
+    for (let i = 0; i < cardQueue.length; i++) {
+      const itemIndexOnPage = i % 9;
+      if (itemIndexOnPage === 0) {
+        page = pdfDoc.addPage([pageWidth, pageHeight]);
+      }
+
+      const col = itemIndexOnPage % 3;
+      const row = Math.floor(itemIndexOnPage / 3);
+
+      const x = marginX + col * CARD_W;
+      // PDF coordinates originate at the bottom-left
+      const y = pageHeight - marginY - (row + 1) * CARD_H;
+
+      const item = cardQueue[i];
+      let imgBytes = imageCache[item.url];
+      if (!imgBytes) {
+        log(`Downloading image for ${item.name}...`);
+        const res = await fetch(item.url);
+        imgBytes = await res.arrayBuffer();
+        imageCache[item.url] = imgBytes;
+      }
+
+      let embeddedImg;
+      try {
+        embeddedImg = await pdfDoc.embedJpg(imgBytes);
+      } catch {
+        embeddedImg = await pdfDoc.embedPng(imgBytes);
+      }
+
+      page.drawImage(embeddedImg, {
+        x: x,
+        y: y,
+        width: CARD_W,
+        height: CARD_H,
+      });
+    }
+
+    log("Finalizing PDF...");
+    const pdfBytes = await pdfDoc.save();
+    const blob = new Blob([pdfBytes], { type: "application/pdf" });
+    const blobUrl = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = "lorcana-proxies.pdf";
+    a.click();
+
+    log(`Success! Generated PDF with ${cardQueue.length} card(s).`);
+    btn.disabled = false;
+  }
+</script>
+</body>
+</html>
